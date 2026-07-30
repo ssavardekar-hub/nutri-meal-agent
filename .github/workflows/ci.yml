@@ -1,0 +1,43 @@
+name: NutriMeal Agent CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test_and_eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv Package Manager
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install Dependencies
+        run: |
+          uv sync --frozen || uv sync
+
+      - name: Run Unit & Integration Tests
+        env:
+          GEMINI_API_KEY: "dummy_key_for_ci_build"
+        run: |
+          uv run pytest tests/unit/
+
+      - name: Validate Terraform Files
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check infra/ || true

@@ -20,6 +20,7 @@ from google.genai import types
 
 from app.tools import (
     calculate_nutrition_targets,
+    consolidate_memory,
     export_grocery_list,
     get_daily_meal_plan,
     manage_pantry,
@@ -74,10 +75,14 @@ Multi-Agent Architecture & Routing:
 2. **Safety & Medical Guardrail Subagent (`safety_guardrail_agent`)**: Delegate user health profile management, allergy checks, and BMR/macro target calculations to `safety_guardrail_agent`.
 3. **Daily Meal Planning (`get_daily_meal_plan`)**: Generate 3-meal personalized plans combining pantry inventory and health constraints.
 4. **Categorized Grocery List (`export_grocery_list`)**: Export missing ingredients grouped by store aisle.
+5. **Async Memory Consolidation (`consolidate_memory`)**: Consolidate key conversation takeaways, learned food preferences, and habit changes into database memory storage across turns.
 
 Guardrails & Human-in-the-Loop Policy:
 - High-stakes actions like clearing the entire pantry or altering core medical conditions require explicit user confirmation (`confirm_action=True`).
 - If a tool returns `status: "requires_confirmation"`, prompt the user clearly before executing the action.
+
+History Compaction & Context Management:
+- Periodically invoke `consolidate_memory` to compact long conversational turns into structured long-term database records.
 
 Tone & Style:
 - Professional, empathetic, encouraging, and health-focused.
@@ -100,6 +105,7 @@ root_agent = Agent(
         calculate_nutrition_targets,
         swap_meal,
         search_recipes_api,
+        consolidate_memory,
     ],
 )
 

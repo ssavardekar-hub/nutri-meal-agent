@@ -15,17 +15,19 @@
 import asyncio
 import json
 import os
-from pathlib import Path
-import urllib.parse
-import urllib.request
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from app.app_utils.logging_utils import log_tool_intent, log_tool_outcome
-
-PANTRY_FILE = Path("pantry.json")
-PROFILE_FILE = Path("profile.json")
+from app.db import (
+    async_consolidate_memory,
+    async_get_consolidated_memories,
+    async_get_pantry,
+    async_get_profile,
+    async_update_pantry,
+    async_update_profile,
+)
 
 
 # --- PYDANTIC SCHEMAS FOR STRICT VALIDATION ---
@@ -110,6 +112,15 @@ class SwapMealInput(BaseModel):
     )
     reason: str = Field(
         default="preference", description="Reason for swapping e.g. 'taste preference', 'missing ingredient'."
+    )
+
+
+class ConsolidateMemoryInput(BaseModel):
+    summary_notes: str = Field(
+        ..., description="Summary of key preferences, learnings, and user interactions to consolidate into long-term database memory."
+    )
+    key_preferences: list[str] | None = Field(
+        default=None, description="List of key user preferences or learned health habits."
     )
 
 
@@ -288,102 +299,63 @@ MOCK_RECIPES = [
 ]
 
 
-# --- ASYNCHRONOUS PERSISTENCE HELPERS ---
-
-def _read_json_sync(filepath: Path, default_data: dict) -> dict:
-    if not filepath.exists():
-        _write_json_sync(filepath, default_data)
-        return default_data
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default_data
-
-
-def _write_json_sync(filepath: Path, data: dict) -> None:
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-async def _async_read_json(filepath: Path, default_data: dict) -> dict:
-    return await asyncio.to_thread(_read_json_sync, filepath, default_data)
-
-
-async def _async_write_json(filepath: Path, data: dict) -> None:
-    await asyncio.to_thread(_write_json_sync, filepath, data)
-
-
-# --- ASYNCHRONOUS AGENT TOOLS WITH PYDANTIC & GUARDRAILS ---
+# --- AGENT TOOLS WITH DATABASE STORAGE & GUARDRAILS ---
 
 async def manage_pantry(
     action: str,
     items: list[str] | None = None,
     confirm_action: bool = False
 ) -> dict[str, Any]:
-    """Manages ingredients in the user's local pantry inventory asynchronously.
+    """Manages ingredients in the user's pantry inventory via SQLite database.
 
     Args:
-        action: One of 'view', 'add', 'remove', or 'clear'.
+        action: 'view', 'add', 'remove', or 'clear'.
         items: Optional list of ingredient names to add or remove.
         confirm_action: Must be set to True for high-stakes destructive operations like 'clear'.
 
     Returns:
-        A dictionary containing the action status, count, and ingredient list.
+        Dictionary containing pantry status and ingredient list.
     """
     try:
         validated = ManagePantryInput(action=action, items=items, confirm_action=confirm_action)
     except Exception as e:
-        err_msg = f"Invalid input parameters for manage_pantry: {e}"
         log_tool_outcome("manage_pantry", "Validation Failed", {}, error=e)
         return {
             "status": "error",
             "error_type": "ValidationError",
-            "error_message": err_msg,
-            "guided_recovery_instructions": (
-                "Please call manage_pantry with action='view', 'add', 'remove', or 'clear'."
-                " For 'add' or 'remove', supply a non-empty list of string items."
-            )
+            "error_message": str(e),
+            "guided_recovery_instructions": "Call manage_pantry with action='view', 'add', 'remove', or 'clear'."
         }
 
-    log_tool_intent("manage_pantry", f"Performing action '{validated.action}' on pantry", {"action": validated.action, "items": validated.items})
-
-    default_pantry = {"ingredients": ["spinach", "eggs", "oats", "chicken breast", "olive oil", "salmon fillet", "quinoa", "garlic", "lemon"]}
-    pantry_data = await _async_read_json(PANTRY_FILE, default_pantry)
-    current_items = set(i.lower().strip() for i in pantry_data.get("ingredients", []))
+    log_tool_intent("manage_pantry", f"Performing action '{validated.action}' on pantry", validated.model_dump())
 
     if validated.action == "clear":
-        # Guardrail: Human-in-the-loop confirmation check for destructive clear operation
         if not validated.confirm_action:
-            log_tool_outcome("manage_pantry", "Clear action blocked by Guardrail", {"pantry_count": len(current_items)})
+            log_tool_outcome("manage_pantry", "Clear action blocked by Guardrail", {})
             return {
                 "status": "requires_confirmation",
                 "guardrail_triggered": "Human-In-The-Loop Confirmation Required",
-                "message": f"Clearing the pantry will remove all {len(current_items)} ingredients. Please ask the user for explicit confirmation before proceeding.",
-                "guided_recovery_instructions": "Ask the user: 'Are you sure you want to clear your entire pantry inventory?' If they say yes, re-call manage_pantry(action='clear', confirm_action=True)."
+                "message": "Clearing the pantry will remove all ingredients. Please ask the user for explicit confirmation before proceeding.",
+                "guided_recovery_instructions": "Ask the user: 'Are you sure you want to clear your entire pantry inventory?' If confirmed, call manage_pantry(action='clear', confirm_action=True)."
             }
-        current_items = set()
+        updated_items = await async_update_pantry("clear")
 
-    elif validated.action == "add" and validated.items:
-        for item in validated.items:
-            if item.strip():
-                current_items.add(item.lower().strip())
+    elif validated.action == "add":
+        updated_items = await async_update_pantry("add", validated.items)
 
-    elif validated.action == "remove" and validated.items:
-        for item in validated.items:
-            current_items.discard(item.lower().strip())
+    elif validated.action == "remove":
+        updated_items = await async_update_pantry("remove", validated.items)
 
-    updated_list = sorted(list(current_items))
-    pantry_data["ingredients"] = updated_list
-    await _async_write_json(PANTRY_FILE, pantry_data)
+    else:  # view
+        updated_items = await async_get_pantry()
 
     res = {
         "status": "success",
         "action_performed": validated.action,
-        "pantry_count": len(updated_list),
-        "ingredients": updated_list
+        "pantry_count": len(updated_items),
+        "ingredients": updated_items
     }
-    log_tool_outcome("manage_pantry", f"Successfully performed '{validated.action}'", res)
+    log_tool_outcome("manage_pantry", f"Pantry action '{validated.action}' complete", res)
     return res
 
 
@@ -396,14 +368,14 @@ async def manage_profile(
     target_calories: int | None = None,
     confirm_action: bool = False
 ) -> dict[str, Any]:
-    """Reads or updates user health profile, dietary restrictions, allergies, and calorie goals.
+    """Reads or updates user health profile, dietary restrictions, allergies, and calorie goals via SQLite DB.
 
     Args:
         action: 'view' or 'update'.
-        dietary_restrictions: Optional list e.g. ['vegetarian', 'gluten-free', 'low-carb'].
-        medical_conditions: Optional list e.g. ['diabetes', 'high cholesterol', 'hypertension'].
+        dietary_restrictions: Optional list e.g. ['vegetarian', 'gluten-free'].
+        medical_conditions: Optional list e.g. ['diabetes', 'high cholesterol'].
         preferred_cuisine: Preferred culinary style.
-        allergies: Optional list e.g. ['peanuts', 'shellfish', 'dairy'].
+        allergies: Optional list e.g. ['peanuts', 'shellfish'].
         target_calories: Target daily calories.
         confirm_action: Must be set to True for major medical updates.
 
@@ -426,43 +398,30 @@ async def manage_profile(
             "status": "error",
             "error_type": "ValidationError",
             "error_message": str(e),
-            "guided_recovery_instructions": "Ensure target_calories is between 1000 and 5000 and lists contain valid strings."
+            "guided_recovery_instructions": "Ensure target_calories is between 1000 and 5000."
         }
 
     log_tool_intent("manage_profile", f"Executing profile action '{validated.action}'", validated.model_dump())
 
-    default_profile = {
-        "dietary_restrictions": ["low-carb"],
-        "medical_conditions": ["diabetes", "high cholesterol"],
-        "preferred_cuisine": "Mediterranean",
-        "allergies": [],
-        "target_calories": 2000
-    }
-    profile_data = await _async_read_json(PROFILE_FILE, default_profile)
-
     if validated.action == "update":
-        # Guardrail: Check for high-stakes medical condition changes
         if validated.medical_conditions is not None and not validated.confirm_action:
             log_tool_outcome("manage_profile", "Medical update blocked by Guardrail", {})
             return {
                 "status": "requires_confirmation",
                 "guardrail_triggered": "Medical Safety Confirmation Required",
-                "message": f"Updating medical conditions to {validated.medical_conditions} affects recipe safety filtering.",
-                "guided_recovery_instructions": "Ask the user: 'Would you like me to update your medical profile to include these conditions?' If confirmed, re-call manage_profile(..., confirm_action=True)."
+                "message": f"Updating medical conditions to {validated.medical_conditions} affects safety filtering.",
+                "guided_recovery_instructions": "Ask the user for confirmation, then call manage_profile(..., confirm_action=True)."
             }
 
-        if validated.dietary_restrictions is not None:
-            profile_data["dietary_restrictions"] = [d.lower().strip() for d in validated.dietary_restrictions]
-        if validated.medical_conditions is not None:
-            profile_data["medical_conditions"] = [m.lower().strip() for m in validated.medical_conditions]
-        if validated.preferred_cuisine is not None:
-            profile_data["preferred_cuisine"] = validated.preferred_cuisine.strip()
-        if validated.allergies is not None:
-            profile_data["allergies"] = [a.lower().strip() for a in validated.allergies]
-        if validated.target_calories is not None:
-            profile_data["target_calories"] = validated.target_calories
-
-        await _async_write_json(PROFILE_FILE, profile_data)
+        profile_data = await async_update_profile(
+            dietary_restrictions=validated.dietary_restrictions,
+            medical_conditions=validated.medical_conditions,
+            preferred_cuisine=validated.preferred_cuisine,
+            allergies=validated.allergies,
+            target_calories=validated.target_calories
+        )
+    else:
+        profile_data = await async_get_profile()
 
     res = {"status": "success", "profile": profile_data}
     log_tool_outcome("manage_profile", f"Profile action '{validated.action}' complete", res)
@@ -522,7 +481,7 @@ async def search_recipes_api(
 
 
 async def get_daily_meal_plan(day_preference: str = "today") -> dict[str, Any]:
-    """Generates a complete 3-meal plan (breakfast, lunch, dinner) tailored to pantry and user health profile.
+    """Generates a complete 3-meal plan tailored to pantry and user health profile.
 
     Args:
         day_preference: 'today' or 'tomorrow'.
@@ -532,10 +491,8 @@ async def get_daily_meal_plan(day_preference: str = "today") -> dict[str, Any]:
     """
     log_tool_intent("get_daily_meal_plan", f"Generating meal plan for {day_preference}", {"day_preference": day_preference})
 
-    pantry_res = await manage_pantry(action="view")
-    profile_res = await manage_profile(action="view")
-    pantry_items = set(pantry_res.get("ingredients", []))
-    profile_info = profile_res.get("profile", {})
+    pantry_items = set(await async_get_pantry())
+    profile_info = await async_get_profile()
 
     medical = profile_info.get("medical_conditions", [])
     allergies = profile_info.get("allergies", [])
@@ -755,10 +712,8 @@ async def swap_meal(
 
     log_tool_intent("swap_meal", f"Swapping meal '{validated.meal_type}'", validated.model_dump())
 
-    profile_res = await manage_profile(action="view")
-    pantry_res = await manage_pantry(action="view")
-    profile_info = profile_res.get("profile", {})
-    pantry_items = set(pantry_res.get("ingredients", []))
+    profile_info = await async_get_profile()
+    pantry_items = set(await async_get_pantry())
 
     all_recipes = await search_recipes_api(
         cuisine=profile_info.get("preferred_cuisine", "Mediterranean"),
@@ -785,4 +740,43 @@ async def swap_meal(
         "new_recipe": selected_recipe
     }
     log_tool_outcome("swap_meal", "Meal swapped successfully", res)
+    return res
+
+
+async def consolidate_memory(
+    summary_notes: str,
+    key_preferences: list[str] | None = None
+) -> dict[str, Any]:
+    """Asynchronously consolidates conversation learnings, user habits, and dietary insights into long-term database storage.
+
+    Args:
+        summary_notes: Key summary points or learnings from recent conversation turns.
+        key_preferences: List of specific user preferences discovered (e.g. ['dislikes cilantro', 'prefers 15-min meals']).
+
+    Returns:
+        Status object confirming memory consolidation in database.
+    """
+    try:
+        validated = ConsolidateMemoryInput(summary_notes=summary_notes, key_preferences=key_preferences)
+    except Exception as e:
+        log_tool_outcome("consolidate_memory", "Validation Failed", {}, error=e)
+        return {
+            "status": "error",
+            "error_type": "ValidationError",
+            "error_message": str(e),
+            "guided_recovery_instructions": "Provide non-empty summary_notes string."
+        }
+
+    log_tool_intent("consolidate_memory", "Consolidating memory into database", validated.model_dump())
+
+    record = await async_consolidate_memory(summary_notes=validated.summary_notes, key_preferences=validated.key_preferences)
+    past_memories = await async_get_consolidated_memories()
+
+    res = {
+        "status": "success",
+        "consolidated_record": record,
+        "total_consolidated_memories_count": len(past_memories),
+        "recent_memories": past_memories
+    }
+    log_tool_outcome("consolidate_memory", "Memory successfully consolidated into database", res)
     return res
