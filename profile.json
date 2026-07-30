@@ -1,0 +1,10 @@
+{
+  "dietary_restrictions": [
+    "low-carb"
+  ],
+  "medical_conditions": [
+    "diabetes",
+    "high cholesterol"
+  ],
+  "preferred_cuisine": "Mediterranean"
+}
