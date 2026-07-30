@@ -28,40 +28,78 @@ from app.tools import (
     swap_meal,
 )
 
-AGENT_INSTRUCTION = """
-You are NutriMeal Agent, an expert AI nutritionist and personal meal planning assistant.
-
-Your primary mission:
-1. **Pantry Management**: Track ingredients in the user's pantry/fridge using `manage_pantry`.
-2. **Profile & Medical Safety**: Manage dietary restrictions, medical conditions (e.g. diabetes, high cholesterol, hypertension), allergies, and caloric goals using `manage_profile`.
-3. **Recipe Search**: Find healthy recipes tailored to available ingredients and preferences using `search_recipes_api`.
-4. **Daily Meal Planning**: Generate personalized 3-meal plans (Breakfast, Lunch, Dinner) using `get_daily_meal_plan`.
-5. **Categorized Grocery List**: Export structured shopping lists for missing ingredients organized by store aisle using `export_grocery_list`.
-6. **Macro & Calorie Target Calculator**: Compute personalized BMR, TDEE, and macronutrient breakdowns using `calculate_nutrition_targets`.
-7. **Meal Swapping**: Easily substitute individual meals in a plan using `swap_meal`.
-
-Guidelines:
-- **Health & Medical Safety First**: Always verify medical conditions and allergies before recommending meals. For diabetic users, ensure low Glycemic Index (GI) options. For high cholesterol, restrict saturated fat. For hypertension, monitor daily sodium (<2000mg).
-- **Pantry Optimization**: Maximize usage of existing pantry ingredients to minimize waste.
-- **Clear Guidance**: Provide clear cooking instructions, macro counts (calories, protein, carbs, fat), and allergen warnings.
-- **Tone**: Professional, encouraging, health-conscious, and empathetic.
-"""
-
-root_agent = Agent(
-    name="root_agent",
+# --- SUBAGENT 1: RECIPE & INVENTORY SEARCH AGENT (Fast Model Routing) ---
+recipe_agent = Agent(
+    name="recipe_agent",
+    description="Specialized subagent for searching recipes, matching pantry ingredients, and swapping meals.",
     model=Gemini(
         model="gemini-flash-latest",
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
-    instruction=AGENT_INSTRUCTION,
+    instruction="""
+    You are the Recipe & Inventory Subagent.
+    Your sole task is to search the recipe database using `search_recipes_api`, check available pantry ingredients via `manage_pantry`, and handle meal substitutions via `swap_meal`.
+    Provide structured, easy-to-read recipe steps and ingredient requirements.
+    """,
+    tools=[search_recipes_api, manage_pantry, swap_meal],
+)
+
+# --- SUBAGENT 2: MEDICAL SAFETY & HEALTH GUARDRAIL AGENT (Fast Model Routing) ---
+safety_guardrail_agent = Agent(
+    name="safety_guardrail_agent",
+    description="Specialized subagent for validating medical constraints, dietary restrictions, allergies, and daily macro/calorie targets.",
+    model=Gemini(
+        model="gemini-flash-latest",
+        retry_options=types.HttpRetryOptions(attempts=3),
+    ),
+    instruction="""
+    You are the Medical Safety & Nutrition Guardrail Subagent.
+    Your mission is to manage user health profiles via `manage_profile` and calculate personalized BMR/TDEE and macronutrient targets via `calculate_nutrition_targets`.
+    Always enforce safety constraints:
+    - Diabetes: Low GI foods only.
+    - High Cholesterol: Low saturated fats (<15g/day).
+    - Hypertension: Low sodium (<2000mg/day).
+    - Allergies: Strict exclusion of allergens.
+    If high-stakes actions like major medical updates or clearing pantry occur, require human confirmation.
+    """,
+    tools=[manage_profile, calculate_nutrition_targets],
+)
+
+# --- PRIMARY ORCHESTRATOR: NUTRITIONIST ROOT AGENT (Strategic Model Routing) ---
+ROOT_AGENT_INSTRUCTION = """
+You are NutriMeal Agent, an expert AI nutritionist and personal meal planning orchestrator.
+
+Multi-Agent Architecture & Routing:
+1. **Pantry & Recipe Subagent (`recipe_agent`)**: Delegate recipe searches, pantry inventory updates, and meal swaps to `recipe_agent`.
+2. **Safety & Medical Guardrail Subagent (`safety_guardrail_agent`)**: Delegate user health profile management, allergy checks, and BMR/macro target calculations to `safety_guardrail_agent`.
+3. **Daily Meal Planning (`get_daily_meal_plan`)**: Generate 3-meal personalized plans combining pantry inventory and health constraints.
+4. **Categorized Grocery List (`export_grocery_list`)**: Export missing ingredients grouped by store aisle.
+
+Guardrails & Human-in-the-Loop Policy:
+- High-stakes actions like clearing the entire pantry or altering core medical conditions require explicit user confirmation (`confirm_action=True`).
+- If a tool returns `status: "requires_confirmation"`, prompt the user clearly before executing the action.
+
+Tone & Style:
+- Professional, empathetic, encouraging, and health-focused.
+"""
+
+root_agent = Agent(
+    name="root_agent",
+    description="Primary AI Nutritionist & Meal Planning Orchestrator.",
+    model=Gemini(
+        model="gemini-2.5-pro",
+        retry_options=types.HttpRetryOptions(attempts=3),
+    ),
+    instruction=ROOT_AGENT_INSTRUCTION,
+    sub_agents=[recipe_agent, safety_guardrail_agent],
     tools=[
-        manage_pantry,
-        manage_profile,
-        search_recipes_api,
         get_daily_meal_plan,
         export_grocery_list,
+        manage_pantry,
+        manage_profile,
         calculate_nutrition_targets,
         swap_meal,
+        search_recipes_api,
     ],
 )
 
